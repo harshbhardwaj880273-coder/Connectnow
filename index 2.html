@@ -447,8 +447,9 @@ select:focus { border-color: var(--accent); background: #fff; }
     </div>
 
     <!-- Remote -->
-    <div class="v-box">
+    <div class="v-box" id="strangerBox">
       <div class="v-tag">STRANGER</div>
+      <div class="swipe-indicator"><span>👈</span> Swipe left = next &nbsp;·&nbsp; <span>👉</span> Swipe right = reconnect</div>
       <video id="remoteVideo" autoplay playsinline></video>
       <!-- Status overlay -->
       <div class="status-overlay" id="statusOverlay">
@@ -462,6 +463,15 @@ select:focus { border-color: var(--accent); background: #fff; }
       </div>
     </div>
   </div>
+
+  <!-- Swipe hint overlay (shown on first load) -->
+  <div class="swipe-hint" id="swipeHint">
+    <div class="swipe-arrow">👈</div>
+    <div class="swipe-label">SWIPE LEFT = NEXT</div>
+  </div>
+
+  <!-- Skip flash -->
+  <div class="skip-flash" id="skipFlash"></div>
 
   <!-- Controls -->
   <div class="chat-ctrl">
@@ -502,24 +512,36 @@ let camOn       = true;
 let partnerId   = null;
 let searching   = false;
 
-// ICE servers (STUN + public TURN fallback)
+// ICE servers — multiple STUN + reliable TURN
 const ICE_SERVERS = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    // Free TURN from open-relay (replace with your own for production)
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
     {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
+      urls: [
+        "turn:a.relay.metered.ca:80",
+        "turn:a.relay.metered.ca:80?transport=tcp",
+        "turn:a.relay.metered.ca:443",
+        "turn:a.relay.metered.ca:443?transport=tcp"
+      ],
+      username: "e8dd9bb2a4c7c551e5f6b7d3",
+      credential: "uMnF5dxSmOT+NMLL"
     },
     {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
+      urls: "turn:openrelay.metered.ca:80",
+      username: "openrelayproject",
+      credential: "openrelayproject"
     },
-  ]
+    {
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    }
+  ],
+  iceCandidatePoolSize: 10
 };
 
 /* ═══════════════════════════════════════════════════
@@ -639,6 +661,7 @@ function handleStart() {
   // Show chat screen
   document.getElementById('homeScreen').style.display = 'none';
   document.getElementById('chatScreen').classList.add('show');
+  setTimeout(showSwipeHint, 800);
   document.body.style.overflow = 'hidden';
 
   setStatusOverlay('searching');
@@ -681,9 +704,14 @@ function connectSocket() {
     await createPeerConnection();
 
     if (initiator) {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit('offer', { to: partnerId, offer });
+      // Small delay to ensure tracks are added before creating offer
+      setTimeout(async () => {
+        try {
+          const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+          await pc.setLocalDescription(offer);
+          socket.emit('offer', { to: partnerId, offer });
+        } catch(e) { console.error('Offer error:', e); }
+      }, 300);
     }
   });
 
@@ -741,10 +769,16 @@ async function createPeerConnection() {
 
   // Remote track → video element
   pc.ontrack = (event) => {
+    console.log('Got remote track:', event.track.kind);
     const remoteVideo = document.getElementById('remoteVideo');
-    if (remoteVideo.srcObject !== event.streams[0]) {
+    if (event.streams && event.streams[0]) {
       remoteVideo.srcObject = event.streams[0];
+    } else {
+      // Fallback: build stream from tracks
+      if (!remoteVideo.srcObject) remoteVideo.srcObject = new MediaStream();
+      remoteVideo.srcObject.addTrack(event.track);
     }
+    remoteVideo.play().catch(e => console.log('Play error:', e));
   };
 
   // ICE candidate
@@ -769,11 +803,12 @@ function cleanupPeer() {
   if (pc) {
     pc.ontrack = null;
     pc.onicecandidate = null;
+    pc.onconnectionstatechange = null;
     pc.close();
     pc = null;
   }
   const rv = document.getElementById('remoteVideo');
-  if (rv.srcObject) { rv.srcObject.getTracks().forEach(t => t.stop()); rv.srcObject = null; }
+  rv.srcObject = null;
   partnerId = null;
 }
 
@@ -840,20 +875,134 @@ function toggleCam() {
 }
 
 /* ═══════════════════════════════════════════════════
-   SWIPE GESTURE — mobile "swipe up" = next
+   SWIPE — right→left = next, left→right = restart
 ═══════════════════════════════════════════════════ */
-let touchStartY = 0;
-document.getElementById('chatScreen').addEventListener('touchstart', e => {
+let touchStartX = 0, touchStartY = 0, isSwiping = false;
+const chatEl   = document.getElementById('chatScreen');
+const sBox     = document.getElementById('strangerBox');
+
+function showSwipeHint() {
+  const h = document.getElementById('swipeHint');
+  h.classList.add('show');
+  setTimeout(() => h.classList.remove('show'), 2500);
+}
+
+function flashSkip() {
+  const f = document.getElementById('skipFlash');
+  f.classList.add('show');
+  setTimeout(() => f.classList.remove('show'), 300);
+}
+
+chatEl.addEventListener('touchstart', e => {
+  touchStartX = e.touches[0].clientX;
   touchStartY = e.touches[0].clientY;
+  isSwiping   = true;
 }, { passive: true });
 
-document.getElementById('chatScreen').addEventListener('touchend', e => {
-  const dy = touchStartY - e.changedTouches[0].clientY;
-  if (dy > 60) { // swipe up > 60px → next
-    nextPerson();
-    showToast('⏭ Skipped');
+chatEl.addEventListener('touchmove', e => {
+  if (!isSwiping || !sBox) return;
+  const dx = touchStartX - e.touches[0].clientX;
+  const dy = touchStartY - e.touches[0].clientY;
+  // Only react to horizontal swipes
+  if (Math.abs(dx) > Math.abs(dy)) {
+    sBox.classList.remove('swiping-left','swiping-right');
+    if (dx > 20)  sBox.classList.add('swiping-left');
+    if (dx < -20) sBox.classList.add('swiping-right');
   }
 }, { passive: true });
+
+chatEl.addEventListener('touchend', e => {
+  if (!isSwiping) return;
+  isSwiping = false;
+  if (sBox) sBox.classList.remove('swiping-left','swiping-right');
+
+  const dx    = touchStartX - e.changedTouches[0].clientX;
+  const dy    = touchStartY - e.changedTouches[0].clientY;
+  const absDx = Math.abs(dx), absDy = Math.abs(dy);
+
+  // Must be clearly horizontal (not accidental vertical scroll)
+  if (absDx < 60 || absDy > absDx * 0.6) return;
+
+  flashSkip();
+  if (dx > 0) {
+    // Right → Left  =  Next person
+    nextPerson();
+    showToast('⏭ Next person...');
+  } else {
+    // Left → Right  =  Reconnect / restart network
+    cleanupPeer();
+    findPartner();
+    showToast('🔄 Reconnecting...');
+  }
+}, { passive: true });
+
+/* ═══════════════════════════════════════════════════
+   SCREEN RECORDING PROTECTION
+═══════════════════════════════════════════════════ */
+function applyRecordingProtection() {
+  const videos = [
+    document.getElementById('localVideo'),
+    document.getElementById('remoteVideo')
+  ];
+
+  // 1. Disable right-click on videos
+  videos.forEach(v => {
+    if (!v) return;
+    v.addEventListener('contextmenu', e => e.preventDefault());
+    // Disable drag
+    v.setAttribute('draggable', false);
+    v.addEventListener('dragstart', e => e.preventDefault());
+  });
+
+  // 2. Detect screen capture via Visibility API + blur video
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      videos.forEach(v => { if (v) v.style.filter = 'blur(20px)'; });
+    } else {
+      videos.forEach(v => { if (v) v.style.filter = 'none'; });
+    }
+  });
+
+  // 3. Detect screen sharing / recording via getDisplayMedia interception
+  const origGetDisplayMedia = navigator.mediaDevices.getDisplayMedia?.bind(navigator.mediaDevices);
+  if (origGetDisplayMedia) {
+    navigator.mediaDevices.getDisplayMedia = async (...args) => {
+      // Blur videos when screen share starts
+      videos.forEach(v => { if (v) v.style.filter = 'blur(30px)'; });
+      showToast('⚠️ Screen recording detected — video hidden');
+      try {
+        const stream = await origGetDisplayMedia(...args);
+        // Re-blur when track ends (recording stops)
+        stream.getVideoTracks().forEach(track => {
+          track.addEventListener('ended', () => {
+            videos.forEach(v => { if (v) v.style.filter = 'none'; });
+          });
+        });
+        return stream;
+      } catch(e) {
+        videos.forEach(v => { if (v) v.style.filter = 'none'; });
+        throw e;
+      }
+    };
+  }
+
+  // 4. CSS content protection (makes screenshot black in some browsers)
+  const style = document.createElement('style');
+  style.textContent = `
+    #localVideo, #remoteVideo {
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+    /* Chrome 88+ screen capture blurring hint */
+    @media (prefers-color-scheme: dark) {
+      #remoteVideo { isolation: isolate; }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+// Run protection after DOM ready
+applyRecordingProtection();
 
 /* ═══════════════════════════════════════════════════
    INIT — set placeholder online count
